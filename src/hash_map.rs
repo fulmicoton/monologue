@@ -1,8 +1,9 @@
 use std::alloc::Layout;
 use std::hash::{Hash as _, Hasher as _};
 use std::marker::PhantomData;
+
 use crate::concurrency_types::sync::Arc;
-use crate::concurrency_types::sync::atomic::{self, AtomicU32, AtomicU64, AtomicPtr, Ordering};
+use crate::concurrency_types::sync::atomic::{self, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 type HashType = u32;
 
@@ -40,9 +41,8 @@ impl Default for AtomicBucketEntry {
             hash_and_version: AtomicU64::new(u64::from(HashAndVersion {
                 hash: 0u32,
                 version: u32::MAX,
-            })
-            ),
-            ptr: Default::default()
+            })),
+            ptr: Default::default(),
         }
     }
 }
@@ -55,52 +55,37 @@ impl AtomicBucketEntry {
 
     #[inline(always)]
     pub fn store_hash_and_version(&self, hash_and_version: HashAndVersion, ordering: Ordering) {
-        self.hash_and_version.store(u64::from(hash_and_version), ordering);
+        self.hash_and_version
+            .store(u64::from(hash_and_version), ordering);
     }
 }
 
 pub struct BytesHashMap<V> {
     arena: bumpalo::Bump<2>,
     data: Arc<BytesHashMapData<V>>,
-    gc_ready_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl<V> Drop for BytesHashMap<V> {
     fn drop(&mut self) {
-        let gc_ready_rx = self.gc_ready_rx.take().unwrap();
-        if !Arc::strong_count(&self.data) == 1 {
-            // Some ReadOnly instance is still refering to our bumpalo Bump.
-            // We defer dropping it until the last one is dropped.
-            //
-            // We will do that in a separate thread.
-            let bumpalo = std::mem::replace(&mut self.arena, bumpalo::Bump::<2>::with_min_align());
-            std::thread::spawn(move || {
-                // We wait on the one shot receiver to properly park our thread.
-                let _ = gc_ready_rx.recv();
-                drop(bumpalo);
-            });
-        } else {
-            // We have the last reference to data.
-            // We can safely drop our bumpalo Bump.
-        }
-
+        let bumpalo = std::mem::replace(&mut self.arena, bumpalo::Bump::<2>::with_min_align());
+        let mut drop_on_last_lock = self.data.drop_on_last.lock().unwrap();
+        *drop_on_last_lock = Some(bumpalo);
     }
 }
 
 impl<V> Default for BytesHashMap<V> {
     fn default() -> BytesHashMap<V> {
-        BytesHashMap::new()
+        BytesHashMap::with_hash_table_size(DEFAULT_HASH_TABLE_SIZE)
     }
 }
 
 impl<V> BytesHashMap<V> {
-    pub fn new() -> BytesHashMap<V> {
-        let (gc_ready_tx, gc_ready_rx) = oneshot::channel();
-        let data = BytesHashMapData::new(gc_ready_tx);
+    pub fn with_hash_table_size(hash_table_size: usize) -> BytesHashMap<V> {
+        assert!(hash_table_size.is_power_of_two());
+        let data = BytesHashMapData::with_hash_table_size(hash_table_size);
         BytesHashMap {
-            arena: bumpalo::Bump::<2>::with_min_align_and_capacity(1_000_000),
+            arena: bumpalo::Bump::<2>::with_min_align(),
             data: Arc::new(data),
-            gc_ready_rx: Some(gc_ready_rx),
         }
     }
 
@@ -121,11 +106,7 @@ impl<V> BytesHashMapReadOnly<V> {
         self.data.version.load(Ordering::Acquire)
     }
 
-    pub fn get(
-        &self,
-        key: &[u8],
-        version: u32,
-    ) -> Option<&V> {
+    pub fn get(&self, key: &[u8], version: u32) -> Option<&V> {
         assert!(key.len() <= u16::MAX as usize);
         let hash = key_hash(key);
         let mut probe = LinearProbing::compute(hash, self.data.mask);
@@ -141,26 +122,34 @@ impl<V> BytesHashMapReadOnly<V> {
                 // This is just a "truncated hash" collision. Let's keep looking.
                 continue;
             }
+            if hash_and_version.version >= version {
+                // This key is not matching our version.
+                // We skip it.
+                //
+                // Of course, since we have already checked the hash, it is very likely to be our key, in which case scanning
+                // further is not necessary. We do not want to check the key however, as we have no guarantee it has been
+                // inserted yet: this could actually lead to a segfault.
+                continue;
+            }
             // This could still be still be 32-bit hash collision. Let's
             // check the actual string.
             //
             // Not we do not check the version here. We are in the single writer here.
             let ptr: *mut u8 = bucket_entry.ptr.load(atomic::Ordering::Relaxed);
             let bucket_key = unsafe {
-                let key_len: usize = std::ptr::read(ptr.offset(std::mem::size_of::<V>() as isize) as *const u16) as usize;
-                std::slice::from_raw_parts(ptr.offset((std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize), key_len)
+                let key_len_ptr = ptr.offset(std::mem::size_of::<V>() as isize) as *const u16;
+                let key_len: usize = std::ptr::read(key_len_ptr as *const u16) as usize;
+                std::slice::from_raw_parts(
+                    ptr.offset((std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize),
+                    key_len,
+                )
             };
             if key == bucket_key {
-                if hash_and_version.version >= version {
-                    // This is the right bucket entry, BUT it was inserted after version.
-                    return None;
-                }
                 let value = unsafe { &*(ptr as *const V) };
                 return Some(value);
             }
         }
     }
-
 }
 
 struct BytesHashMapData<V> {
@@ -168,18 +157,22 @@ struct BytesHashMapData<V> {
     buckets: Box<[AtomicBucketEntry]>,
     mask: usize,
     data: PhantomData<V>,
-    // The point of this sender is just to get waked up when BytesHashMapData is dropped.
-    _gc_ready_tx: oneshot::Sender<()>,
+    drop_on_last: crate::concurrency_types::sync::Mutex<Option<bumpalo::Bump<2>>>,
 }
 
+const DEFAULT_HASH_TABLE_SIZE: usize = 1 << 20;
+
 impl<V> BytesHashMapData<V> {
-    fn new(gc_ready_tx: oneshot::Sender<()>) -> Self {
+    fn with_hash_table_size(hash_table_size: usize) -> Self {
         BytesHashMapData {
             version: AtomicU32::new(0),
-            buckets: std::iter::repeat_with(AtomicBucketEntry::default).take(1 << 20).collect::<Vec<AtomicBucketEntry>>().into_boxed_slice(),
-            mask: (1<<20) - 1,
+            buckets: std::iter::repeat_with(AtomicBucketEntry::default)
+                .take(hash_table_size)
+                .collect::<Vec<AtomicBucketEntry>>()
+                .into_boxed_slice(),
+            mask: hash_table_size - 1,
             data: PhantomData,
-            _gc_ready_tx: gc_ready_tx,
+            drop_on_last: crate::concurrency_types::sync::Mutex::new(None),
         }
     }
 }
@@ -215,7 +208,7 @@ fn key_hash(key: &[u8]) -> HashType {
 
 impl<V> BytesHashMap<V> {
     pub fn release(&self) {
-        self.data.version.fetch_add(1u32, Ordering::Relaxed);
+        self.data.version.fetch_add(1u32, Ordering::Release);
     }
 
     pub fn mutate_or_create(
@@ -237,16 +230,29 @@ impl<V> BytesHashMap<V> {
                 let new_value = creator();
                 // bucket_entry.store_hash_and_version(HashAndVersion { hash, version }, Ordering::Relaxed);
                 let key_len = key.len();
-                let (size, align) = (std::mem::size_of_val(&new_value) + 2 + key.len(), std::mem::align_of_val(&new_value));
+                let (size, align) = (
+                    std::mem::size_of_val(&new_value) + 2 + key.len(),
+                    std::mem::align_of_val(&new_value),
+                );
                 let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
                 let dst: *mut u8 = self.arena.alloc_layout(layout).as_ptr();
                 unsafe {
                     std::ptr::write(dst as *mut V, new_value);
-                    std::ptr::write(dst.offset(std::mem::size_of::<V>() as isize) as *mut u16, key_len as u16);
-                    std::ptr::copy_nonoverlapping(key.as_ptr(), dst.offset((std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize), key_len);
+                    std::ptr::write(
+                        dst.offset(std::mem::size_of::<V>() as isize) as *mut u16,
+                        key_len as u16,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        key.as_ptr(),
+                        dst.offset(
+                            (std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize,
+                        ),
+                        key_len,
+                    );
                 }
                 bucket_entry.ptr.store(dst, atomic::Ordering::Relaxed);
-                bucket_entry.store_hash_and_version(HashAndVersion { hash, version }, atomic::Ordering::Relaxed);
+                let hash_and_version = HashAndVersion { hash, version };
+                bucket_entry.store_hash_and_version(hash_and_version, atomic::Ordering::Relaxed);
                 break;
             }
             // We have found a possible match.
@@ -254,8 +260,17 @@ impl<V> BytesHashMap<V> {
             if hash == hash_and_version.hash {
                 // No need to check for the version. We are in the single writer here.
                 let ptr: *mut u8 = bucket_entry.ptr.load(atomic::Ordering::Relaxed);
-                let key_len: usize = unsafe { std::ptr::read(ptr.offset(std::mem::size_of::<V>() as isize) as *const u16) } as usize;
-                let bucket_key = unsafe { std::slice::from_raw_parts(ptr.offset((std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize), key_len) };
+                let key_len: usize = unsafe {
+                    std::ptr::read(ptr.offset(std::mem::size_of::<V>() as isize) as *const u16)
+                } as usize;
+                let bucket_key = unsafe {
+                    std::slice::from_raw_parts(
+                        ptr.offset(
+                            (std::mem::size_of::<V>() + std::mem::size_of::<u16>()) as isize,
+                        ),
+                        key_len,
+                    )
+                };
                 if key == bucket_key {
                     let value = unsafe { &*(ptr as *const V) };
                     updator(value);

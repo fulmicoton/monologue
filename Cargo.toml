@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 ahash = "0.8.12"
 bumpalo = {version="3.19.0", features=["boxed"]}
-oneshot = "0.1.11"
+# oneshot = "0.1.11"
 # crossbeam_epoch = {version="0.9"}
 
 [target.'cfg(loom)'.dev-dependencies]
