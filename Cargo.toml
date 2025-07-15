@@ -4,13 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ahash = "0.8.12"
 bumpalo = {version="3.19.0", features=["boxed"]}
-# oneshot = "0.1.11"
-# crossbeam_epoch = {version="0.9"}
+arc-swap = "0.4.0"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = { version = "0.7", features = ["checkpoint", "futures"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[[bench]]
+name = "hash_map_benchmark"
+harness = false
+
+[dev-dependencies]
+criterion = "0.6.0"
+hashbrown = "0.15.0"
