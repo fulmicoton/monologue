@@ -4,12 +4,17 @@ const MIN_ALIGN: usize = 8;
 const DEFAULT_HASH_TABLE_SIZE: usize = 1 << 10;
 
 use crate::concurrency_types::arc_from_box;
-use crate::{LinearProbing, murmurhash2};
+use crate::murmurhash2;
 use std::alloc::Layout;
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 
 use crate::concurrency_types::sync::Arc;
 use crate::concurrency_types::sync::atomic::{self, AtomicPtr, AtomicU64, Ordering};
+
+fn linear_probing(hash: crate::HashType, mask: usize) -> impl Iterator<Item = usize> {
+    (hash as usize..).map(move |idx| idx & mask)
+}
 
 #[derive(Clone, Default, Copy, Eq, PartialEq, Debug)]
 struct HashAndVersion {
@@ -99,20 +104,10 @@ impl AtomicBucketEntry {
 }
 
 pub struct BytesHashMap<V> {
-    buckets: Arc<[AtomicBucketEntry]>,
-    mask: usize,
-    data: Arc<BytesHashMapData<V>>,
-    len: usize,
-    version: u32,
-    arena: bumpalo::Bump<MIN_ALIGN>,
-}
-
-impl<V> Drop for BytesHashMap<V> {
-    fn drop(&mut self) {
-        let bumpalo = std::mem::replace(&mut self.arena, bumpalo::Bump::with_min_align());
-        let mut drop_on_last_lock = self.data.drop_on_last.lock().unwrap();
-        *drop_on_last_lock = Some(bumpalo);
-    }
+    core: BytesHashMapCore<V>,
+    // We use this trick to mark Snapshots as !Send.
+    // Snapshot heavily rely on the guarantee of reordering in
+    _non_send_marker: PhantomData<*mut ()>,
 }
 
 impl<V> Default for BytesHashMap<V> {
@@ -121,9 +116,23 @@ impl<V> Default for BytesHashMap<V> {
     }
 }
 
+impl<V> Deref for BytesHashMap<V> {
+    type Target = BytesHashMapCore<V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl<V> DerefMut for BytesHashMap<V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
 impl<V> BytesHashMap<V> {
     pub fn with_capacity(hash_table_size: usize) -> BytesHashMap<V> {
-        let hash_table_size = hash_table_size.next_power_of_two();
+        let hash_table_size = (hash_table_size * 2).next_power_of_two();
         let mask = hash_table_size - 1;
         let buckets: Arc<[AtomicBucketEntry]> = arc_from_box(
             std::iter::repeat_with(AtomicBucketEntry::default)
@@ -132,29 +141,49 @@ impl<V> BytesHashMap<V> {
                 .into_boxed_slice(),
         );
         let data = BytesHashMapData::with_buckets(buckets.clone());
-        BytesHashMap {
+        let core = BytesHashMapCore {
             len: 0,
             version: 1,
             buckets,
             mask,
             arena: bumpalo::Bump::with_min_align(),
             data: Arc::new(data),
+        };
+        BytesHashMap {
+            core,
+            _non_send_marker: PhantomData,
         }
     }
 
+    pub fn release_and_pack_for_send(mut self) -> BytesHashMapPackedForSend<V> {
+        self.release();
+        BytesHashMapPackedForSend(self.core)
+    }
+
     pub fn capacity(&self) -> usize {
-        self.buckets.len()
+        self.buckets.len() / 2
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get<'a>(&'a mut self, key: &'a [u8]) -> Option<&'a V> {
+        match self.entry(key) {
+            Entry::Occupied(occupied_entry) => Some(occupied_entry.get()),
+            Entry::Vacant(_) => None,
+        }
     }
 
     pub fn entry<'a>(&'a mut self, key: &'a [u8]) -> Entry<'a, V> {
         assert!(key.len() <= u16::MAX as usize);
-        if self.len * 2 >= self.buckets.len() {
-            self.grow_hash_table();
-        }
+
         let hash = murmurhash2(key);
-        let mut probe = LinearProbing::compute(hash, self.mask);
-        loop {
-            let bucket_id = probe.next_probe();
+        for bucket_id in linear_probing(hash, self.mask) {
             let bucket_entry = &self.buckets[bucket_id];
             let hash_and_version = bucket_entry.load_hash_and_version(Ordering::Relaxed);
             if hash_and_version.is_empty() {
@@ -169,14 +198,15 @@ impl<V> BytesHashMap<V> {
                 let ptr: *mut u8 = bucket_entry.ptr.load(atomic::Ordering::Relaxed);
                 if unsafe { is_key_equal::<V>(ptr, key) } {
                     let value = unsafe { &*(ptr as *const V) };
-                    return Entry::Occupied(OccupiedEntry { key, value });
+                    return Entry::Occupied(OccupiedEntry { value });
                 }
             }
         }
+        unreachable!()
     }
 
     fn grow_hash_table(&mut self) {
-        let new_hash_table_size = self.capacity() * 2;
+        let new_hash_table_size = self.buckets.len() * 2;
         let new_mask = new_hash_table_size - 1;
         let new_buckets: Arc<[AtomicBucketEntry]> = arc_from_box(
             std::iter::repeat_with(AtomicBucketEntry::default)
@@ -191,9 +221,7 @@ impl<V> BytesHashMap<V> {
                 continue;
             }
             let ptr = bucket.ptr.load(Ordering::Relaxed);
-            let mut probe = LinearProbing::compute(hash_and_version.hash, new_mask);
-            loop {
-                let bucket_id = probe.next_probe();
+            for bucket_id in linear_probing(hash_and_version.hash, new_mask) {
                 let target_bucket_entry = &new_buckets[bucket_id];
                 if target_bucket_entry
                     .load_hash_and_version(Ordering::Relaxed)
@@ -210,16 +238,10 @@ impl<V> BytesHashMap<V> {
         self.mask = new_mask;
     }
 
-    /// Publishes all changes made to the `BytesHashMap` since the last `release` call,
-    /// making them atomically visible to all `BytesHashMapReadOnly` instances.
-    ///
-    /// This method is the key to the single-writer, multiple-reader concurrency model.
-    /// All write operations (`entry`, `or_insert`, etc.) are buffered and are not
-    /// visible to readers until this method is called.
-    ///
-    /// This allows the writer to batch a series of changes and make them available
-    /// to readers as a single, atomic update. Each call to `release` increments
-    /// the internal version of the hash map.
+    /// Publishes all changes made to the `BytesHashMap` since the last `release` call.
+    /// These changes will only be made visible to new snapshots.
+    //
+    /// This operation is cheap! It is just an atomic store with Release Ordering.
     pub fn release(&mut self) {
         self.version += 1u32;
         let len_and_version = LenAndVersion {
@@ -239,10 +261,63 @@ impl<V> BytesHashMap<V> {
     ///
     /// It is essential to create the read-only handle *before* the writer thread
     /// takes ownership of the `BytesHashMap`.
-    pub fn read_only(&self) -> BytesHashMapReadOnly<V> {
-        BytesHashMapReadOnly {
+    pub fn snapshot_provider(&self) -> BytesHashMapSnapshotProvider<V> {
+        BytesHashMapSnapshotProvider {
             data: self.data.clone(),
         }
+    }
+}
+
+pub struct BytesHashMapPackedForSend<V>(BytesHashMapCore<V>);
+
+impl<V> BytesHashMapPackedForSend<V> {
+    pub fn unpack(self) -> BytesHashMap<V> {
+        // Rust's memory model does not guarantee us after sending this struct to another
+        // thread, the version we load is not in the past, hence the loop.
+        //
+        // In practise, we expect that to never happen.
+        loop {
+            let LenAndVersion {len, version} = self.0.data.load_len_and_version();
+            // This inequality is implied by the fact that we release before packing.
+            assert!(len as usize <= self.0.len);
+            assert!(version <= self.0.version);
+            if version == self.0.version {
+                break;
+            }
+        }
+        BytesHashMap {
+            core: self.0,
+            _non_send_marker: PhantomData,
+        }
+    }
+}
+
+pub struct BytesHashMapCore<V> {
+    buckets: Arc<[AtomicBucketEntry]>,
+    mask: usize,
+    data: Arc<BytesHashMapData<V>>,
+    len: usize,
+    version: u32,
+    arena: bumpalo::Bump<MIN_ALIGN>,
+}
+
+impl<V> Drop for BytesHashMapCore<V> {
+    fn drop(&mut self) {
+        let bumpalo = std::mem::replace(&mut self.arena, bumpalo::Bump::with_min_align());
+        let mut drop_on_last_lock = self.data.drop_on_last.lock().unwrap();
+        *drop_on_last_lock = Some(bumpalo);
+    }
+}
+
+impl<V> From<BytesHashMap<V>> for BytesHashMapPackedForSend<V> {
+    fn from(hash_map: BytesHashMap<V>) -> Self {
+        hash_map.release_and_pack_for_send()
+    }
+}
+
+impl<V> From<BytesHashMapPackedForSend<V>> for BytesHashMap<V> {
+    fn from(hash_map_packed: BytesHashMapPackedForSend<V>) -> Self {
+        hash_map_packed.unpack()
     }
 }
 
@@ -268,15 +343,10 @@ impl<'a, V> Entry<'a, V> {
 }
 
 pub struct OccupiedEntry<'a, V> {
-    key: &'a [u8],
     value: &'a V,
 }
 
 impl<'a, V> OccupiedEntry<'a, V> {
-    pub fn key(&self) -> &'a [u8] {
-        self.key
-    }
-
     pub fn get(&self) -> &'a V {
         self.value
     }
@@ -295,9 +365,12 @@ impl<'a, V> VacantEntry<'a, V> {
     }
 
     pub fn insert(self, value: V) -> &'a V {
+        self.map.len += 1;
+        if self.map.len * 2 > self.map.buckets.len() {
+            self.map.grow_hash_table();
+        }
         let bucket_entry = &self.map.buckets[self.bucket_id];
         let version = self.map.version;
-        self.map.len += 1;
         store_into_bucket(
             bucket_entry,
             HashAndVersion {
@@ -319,15 +392,25 @@ impl<'a, V> VacantEntry<'a, V> {
 /// Contrary, to `BytesHashMapSnapshot` or the `BytesHashMap`,
 /// it is `Send`!
 #[derive(Clone)]
-pub struct BytesHashMapReadOnly<V> {
+pub struct BytesHashMapSnapshotProvider<V> {
     data: Arc<BytesHashMapData<V>>,
 }
 
-impl<V> BytesHashMapReadOnly<V> {
-    pub fn snapshot(&self) -> BytesHashMapSnapshot<V> {
+impl<V> BytesHashMapSnapshotProvider<V> {
+    pub fn snapshot(&self) -> BytesHashMapSnapshot<'_, V> {
+        let LenAndVersion { len, version } = self.data.load_len_and_version();
+        BytesHashMapSnapshot {
+            data: &*self.data,
+            len,
+            version,
+            _non_send_marker: PhantomData,
+        }
+    }
+
+    pub fn owned_snapshot(&self) -> BytesHashMapOwnedSnapshot<V> {
         let LenAndVersion { len, version } =
             LenAndVersion::from(self.data.len_and_version.load(Ordering::Acquire));
-        BytesHashMapSnapshot {
+        BytesHashMapOwnedSnapshot {
             data: self.data.clone(),
             len,
             version,
@@ -337,14 +420,16 @@ impl<V> BytesHashMapReadOnly<V> {
 }
 
 #[derive(Clone)]
-pub struct BytesHashMapSnapshot<V> {
-    data: Arc<BytesHashMapData<V>>,
+pub struct BytesHashMapSnapshot<'a, V> {
+    data: &'a BytesHashMapData<V>,
     version: u32,
     len: u32,
+    // We use this trick to mark Snapshots as !Send.
+    // Snapshot heavily rely on the guarantee of reordering in
     _non_send_marker: PhantomData<*mut ()>,
 }
 
-impl<V> BytesHashMapSnapshot<V> {
+impl<'a, V> BytesHashMapSnapshot<'a, V> {
     pub fn get(&self, key: &[u8]) -> Option<&V> {
         self.data.get_with_version(key, self.version)
     }
@@ -363,6 +448,30 @@ impl<V> BytesHashMapSnapshot<V> {
     }
 }
 
+#[derive(Clone)]
+pub struct BytesHashMapOwnedSnapshot<V> {
+    data: Arc<BytesHashMapData<V>>,
+    version: u32,
+    len: u32,
+    // We use this trick to mark Snapshots as !Send.
+    // Snapshot heavily rely on the guarantee of reordering in
+    _non_send_marker: PhantomData<*mut ()>,
+}
+
+impl<V> BytesHashMapOwnedSnapshot<V> {
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.data.get_with_version(key, self.version)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 struct BytesHashMapData<V> {
     len_and_version: AtomicU64,
     // Does it feel dumb to have a ArcSwap<Arc>?
@@ -373,15 +482,17 @@ struct BytesHashMapData<V> {
 }
 
 impl<V> BytesHashMapData<V> {
+    fn load_len_and_version(&self) -> LenAndVersion {
+        LenAndVersion::from(self.len_and_version.load(Ordering::Acquire))
+    }
+
     fn get_with_version(&self, key: &[u8], version: u32) -> Option<&V> {
         assert!(key.len() <= u16::MAX as usize);
         let hash = murmurhash2(key);
         let buckets_guard = self.buckets.load();
         let buckets = &**buckets_guard.as_ref();
         let mask = buckets.len() - 1;
-        let mut probe = LinearProbing::compute(hash, mask);
-        loop {
-            let bucket_id = probe.next_probe();
+        for bucket_id in linear_probing(hash, mask) {
             let bucket_entry = &buckets[bucket_id];
             let hash_and_version = bucket_entry.load_hash_and_version(Ordering::Relaxed);
             if hash_and_version.is_empty() {
@@ -395,6 +506,7 @@ impl<V> BytesHashMapData<V> {
                 }
             }
         }
+        unreachable!()
     }
 
     fn with_buckets(buckets: Arc<[AtomicBucketEntry]>) -> Self {
@@ -474,36 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_api() {
-        let mut map = BytesHashMap::<u32>::with_capacity(16);
-        let key = b"hello";
-
-        // Test inserting a new key
-        let value = match map.entry(key) {
-            Entry::Occupied(_) => panic!("should be vacant"),
-            Entry::Vacant(vacant) => vacant.insert(42),
-        };
-        assert_eq!(*value, 42);
-
-        // Test getting an existing key
-        let value = match map.entry(key) {
-            Entry::Occupied(occupied) => occupied.get(),
-            Entry::Vacant(_) => panic!("should be occupied"),
-        };
-        assert_eq!(*value, 42);
-    }
-
-    #[test]
-    fn test_or_insert_with() {
-        let mut map = BytesHashMap::<u32>::with_capacity(16);
-        let key = b"hello";
-
-        // Test inserting a new key
-        let value = map.entry(key).or_insert_with(|| 42);
-        assert_eq!(*value, 42);
-
-        // Test getting an existing key
-        let value = map.entry(key).or_insert_with(|| 43);
-        assert_eq!(*value, 42);
+    fn test_linear_probing() {
+        let probes: Vec<usize> = linear_probing(3, 8 - 1).take(8).collect();
+        assert_eq!(&probes, &[3, 4, 5, 6, 7, 0, 1, 2]);
     }
 }

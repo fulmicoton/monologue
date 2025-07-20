@@ -8,7 +8,7 @@ fn test_concurrency_creation_then_mutation() {
     // Here we test a simple key insertion, followed by a key mutation
     loom::model(|| {
         let mut bytes_hash_map: BytesHashMap<AtomicUsize> = BytesHashMap::with_capacity(1 << 4);
-        let bytes_hash_map_read_only = bytes_hash_map.read_only();
+        let bytes_hash_map_snapshot_provider = bytes_hash_map.snapshot_provider();
 
         let writing_thread_handle = loom::thread::spawn(move || {
             bytes_hash_map
@@ -24,7 +24,7 @@ fn test_concurrency_creation_then_mutation() {
         });
         // There is a bug here: the bump memory may have been released too early!
         let reading_thread_handle = loom::thread::spawn(move || {
-            let snapshot = bytes_hash_map_read_only.snapshot();
+            let snapshot = bytes_hash_map_snapshot_provider.snapshot();
             let version = snapshot.version();
             let v1 = snapshot.get(b"key");
             assert!(version <= 3);
@@ -51,7 +51,7 @@ fn test_concurrency_logic_all_or_nothing() {
     // Here we make sure that either a client sees all of the changes or they see none.
     loom::model(|| {
         let mut bytes_hash_map: BytesHashMap<AtomicUsize> = BytesHashMap::with_capacity(1 << 4);
-        let bytes_hash_map_read_only = bytes_hash_map.read_only();
+        let bytes_hash_map_snapshot_provider = bytes_hash_map.snapshot_provider();
 
         let writing_thread_handle = loom::thread::spawn(move || {
             bytes_hash_map.entry(b"key").or_insert(AtomicUsize::new(1));
@@ -59,7 +59,7 @@ fn test_concurrency_logic_all_or_nothing() {
             bytes_hash_map.release();
         });
         let reading_thread_handle = loom::thread::spawn(move || {
-            let snapshot = bytes_hash_map_read_only.snapshot();
+            let snapshot = bytes_hash_map_snapshot_provider.snapshot();
             let version = snapshot.version();
             let v1 = snapshot.get(b"key");
             let v2 = snapshot.get(b"key2");
