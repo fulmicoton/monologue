@@ -24,8 +24,9 @@ fn test_concurrency_creation_then_mutation() {
         });
         // There is a bug here: the bump memory may have been released too early!
         let reading_thread_handle = loom::thread::spawn(move || {
-            let version = bytes_hash_map_read_only.version();
-            let v1 = bytes_hash_map_read_only.get_with_version(b"key", version);
+            let snapshot = bytes_hash_map_read_only.snapshot();
+            let version = snapshot.version();
+            let v1 = snapshot.get(b"key");
             assert!(version <= 3);
             assert!(version >= 1);
             if version == 1 {
@@ -58,9 +59,10 @@ fn test_concurrency_logic_all_or_nothing() {
             bytes_hash_map.release();
         });
         let reading_thread_handle = loom::thread::spawn(move || {
-            let version = bytes_hash_map_read_only.version();
-            let v1 = bytes_hash_map_read_only.get_with_version(b"key", version);
-            let v2 = bytes_hash_map_read_only.get_with_version(b"key2", version);
+            let snapshot = bytes_hash_map_read_only.snapshot();
+            let version = snapshot.version();
+            let v1 = snapshot.get(b"key");
+            let v2 = snapshot.get(b"key2");
             assert!(version >= 1);
             assert!(version <= 2);
             if version == 1 {

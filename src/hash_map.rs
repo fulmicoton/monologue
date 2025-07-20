@@ -3,15 +3,13 @@ use arc_swap::ArcSwap;
 const MIN_ALIGN: usize = 8;
 const DEFAULT_HASH_TABLE_SIZE: usize = 1 << 10;
 
-use crate::HashType;
 use crate::concurrency_types::arc_from_box;
+use crate::{LinearProbing, murmurhash2};
 use std::alloc::Layout;
 use std::marker::PhantomData;
 
 use crate::concurrency_types::sync::Arc;
-use crate::concurrency_types::sync::atomic::{
-    self, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use crate::concurrency_types::sync::atomic::{self, AtomicPtr, AtomicU64, Ordering};
 
 #[derive(Clone, Default, Copy, Eq, PartialEq, Debug)]
 struct HashAndVersion {
@@ -40,6 +38,29 @@ impl From<HashAndVersion> for u64 {
     #[inline(always)]
     fn from(has_and_version: HashAndVersion) -> u64 {
         ((has_and_version.hash as u64) << 32) | (has_and_version.version as u64)
+    }
+}
+
+#[derive(Clone, Default, Copy, Eq, PartialEq, Debug)]
+struct LenAndVersion {
+    len: u32,
+    version: u32,
+}
+
+impl From<LenAndVersion> for u64 {
+    #[inline(always)]
+    fn from(len_and_version: LenAndVersion) -> u64 {
+        ((len_and_version.len as u64) << 32) | (len_and_version.version as u64)
+    }
+}
+
+impl From<u64> for LenAndVersion {
+    #[inline(always)]
+    fn from(value: u64) -> Self {
+        LenAndVersion {
+            len: (value >> 32) as u32,
+            version: value as u32,
+        }
     }
 }
 
@@ -81,6 +102,8 @@ pub struct BytesHashMap<V> {
     buckets: Arc<[AtomicBucketEntry]>,
     mask: usize,
     data: Arc<BytesHashMapData<V>>,
+    len: usize,
+    version: u32,
     arena: bumpalo::Bump<MIN_ALIGN>,
 }
 
@@ -110,6 +133,8 @@ impl<V> BytesHashMap<V> {
         );
         let data = BytesHashMapData::with_buckets(buckets.clone());
         BytesHashMap {
+            len: 0,
+            version: 1,
             buckets,
             mask,
             arena: bumpalo::Bump::with_min_align(),
@@ -123,10 +148,10 @@ impl<V> BytesHashMap<V> {
 
     pub fn entry<'a>(&'a mut self, key: &'a [u8]) -> Entry<'a, V> {
         assert!(key.len() <= u16::MAX as usize);
-        if self.data.len() * 2 >= self.buckets.len() {
+        if self.len * 2 >= self.buckets.len() {
             self.grow_hash_table();
         }
-        let hash = crate::murmurhash2(key);
+        let hash = murmurhash2(key);
         let mut probe = LinearProbing::compute(hash, self.mask);
         loop {
             let bucket_id = probe.next_probe();
@@ -195,8 +220,15 @@ impl<V> BytesHashMap<V> {
     /// This allows the writer to batch a series of changes and make them available
     /// to readers as a single, atomic update. Each call to `release` increments
     /// the internal version of the hash map.
-    pub fn release(&self) {
-        self.data.version.fetch_add(1u32, Ordering::Release);
+    pub fn release(&mut self) {
+        self.version += 1u32;
+        let len_and_version = LenAndVersion {
+            len: self.len as u32,
+            version: self.version,
+        };
+        self.data
+            .len_and_version
+            .store(u64::from(len_and_version), Ordering::Release);
     }
 
     /// Creates a read-only handle to the `BytesHashMap`.
@@ -264,8 +296,8 @@ impl<'a, V> VacantEntry<'a, V> {
 
     pub fn insert(self, value: V) -> &'a V {
         let bucket_entry = &self.map.buckets[self.bucket_id];
-        let version = self.map.data.version.load(Ordering::Relaxed);
-        self.map.data.len.fetch_add(1, atomic::Ordering::Relaxed);
+        let version = self.map.version;
+        self.map.len += 1;
         store_into_bucket(
             bucket_entry,
             HashAndVersion {
@@ -279,24 +311,72 @@ impl<'a, V> VacantEntry<'a, V> {
     }
 }
 
+/// Read-only does not do much in itself.
+///
+/// It does not give you access to the underlying data directly.
+/// It requires a snapshot to access the data.
+///
+/// Contrary, to `BytesHashMapSnapshot` or the `BytesHashMap`,
+/// it is `Send`!
 #[derive(Clone)]
 pub struct BytesHashMapReadOnly<V> {
     data: Arc<BytesHashMapData<V>>,
 }
 
 impl<V> BytesHashMapReadOnly<V> {
-    pub fn version(&self) -> u32 {
-        self.data.version.load(Ordering::Acquire)
+    pub fn snapshot(&self) -> BytesHashMapSnapshot<V> {
+        let LenAndVersion { len, version } =
+            LenAndVersion::from(self.data.len_and_version.load(Ordering::Acquire));
+        BytesHashMapSnapshot {
+            data: self.data.clone(),
+            len,
+            version,
+            _non_send_marker: PhantomData,
+        }
     }
+}
 
+#[derive(Clone)]
+pub struct BytesHashMapSnapshot<V> {
+    data: Arc<BytesHashMapData<V>>,
+    version: u32,
+    len: u32,
+    _non_send_marker: PhantomData<*mut ()>,
+}
+
+impl<V> BytesHashMapSnapshot<V> {
     pub fn get(&self, key: &[u8]) -> Option<&V> {
-        self.get_with_version(key, self.version())
+        self.data.get_with_version(key, self.version)
     }
 
-    pub fn get_with_version(&self, key: &[u8], version: u32) -> Option<&V> {
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(all(loom, test))]
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+struct BytesHashMapData<V> {
+    len_and_version: AtomicU64,
+    // Does it feel dumb to have a ArcSwap<Arc>?
+    // Certainly yes, but ArcSwap<..> requires the object it holds to be sized.
+    buckets: ArcSwap<Arc<[AtomicBucketEntry]>>,
+    data: PhantomData<V>,
+    drop_on_last: crate::concurrency_types::sync::Mutex<Option<bumpalo::Bump<MIN_ALIGN>>>,
+}
+
+impl<V> BytesHashMapData<V> {
+    fn get_with_version(&self, key: &[u8], version: u32) -> Option<&V> {
         assert!(key.len() <= u16::MAX as usize);
-        let hash = crate::murmurhash2(key);
-        let buckets_guard = self.data.buckets.load();
+        let hash = murmurhash2(key);
+        let buckets_guard = self.buckets.load();
         let buckets = &**buckets_guard.as_ref();
         let mask = buckets.len() - 1;
         let mut probe = LinearProbing::compute(hash, mask);
@@ -317,68 +397,16 @@ impl<V> BytesHashMapReadOnly<V> {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.data.capacity()
-    }
-}
-
-struct BytesHashMapData<V> {
-    version: AtomicU32,
-    // Does it feel dumb to have a ArcSwap<Arc>?
-    // Certainly yes, but ArcSwap<..> requires the object it holds to be sized.
-    buckets: ArcSwap<Arc<[AtomicBucketEntry]>>,
-    data: PhantomData<V>,
-    drop_on_last: crate::concurrency_types::sync::Mutex<Option<bumpalo::Bump<MIN_ALIGN>>>,
-    len: AtomicUsize,
-}
-
-impl<V> BytesHashMapData<V> {
     fn with_buckets(buckets: Arc<[AtomicBucketEntry]>) -> Self {
         BytesHashMapData {
-            version: AtomicU32::new(1),
+            len_and_version: AtomicU64::new(u64::from(LenAndVersion {
+                len: 0u32,
+                version: 1u32,
+            })),
             buckets: ArcSwap::new(std::sync::Arc::new(buckets)),
             data: PhantomData,
             drop_on_last: crate::concurrency_types::sync::Mutex::new(None),
-            len: AtomicUsize::new(0),
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len.load(atomic::Ordering::Relaxed)
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.buckets.load().len()
-    }
-}
-
-struct LinearProbing {
-    pos: usize,
-    mask: usize,
-}
-
-impl LinearProbing {
-    #[inline]
-    fn compute(hash: HashType, mask: usize) -> LinearProbing {
-        LinearProbing {
-            pos: hash as usize,
-            mask,
-        }
-    }
-
-    #[inline]
-    fn next_probe(&mut self) -> usize {
-        // Not saving the masked version removes a dependency.
-        self.pos = self.pos.wrapping_add(1);
-        self.pos & self.mask
     }
 }
 
